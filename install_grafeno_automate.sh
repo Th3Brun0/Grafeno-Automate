@@ -1,1003 +1,1324 @@
 #!/bin/bash
 
-# Script de instalação automática do Grafeno Automate
-# Sistema de gerenciamento de Mikrotiks com Ansible
-
 set -e
 
 echo "=========================================="
-echo "    GRAFENO AUTOMATE - INSTALAÇÃO"
+echo "     ANSITRIX INSTALLATION SCRIPT"
 echo "=========================================="
 
-# Cores para output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# ==========================================
+# PARTE 1: SISTEMA E DEPENDÊNCIAS
+# ==========================================
 
-# Função para log
-log() {
-    echo -e "${GREEN}[INFO]${NC} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-    exit 1
-}
-
-# Verificar se é root
-if [ "$EUID" -ne 0 ]; then
-    error "Execute este script como root (sudo ./install_grafeno_automate.sh)"
-fi
+echo "Iniciando instalação do Ansitrix..."
+echo "Parte 1: Atualizando sistema e instalando dependências..."
 
 # Atualizar sistema
-log "Atualizando sistema..."
-apt update && apt upgrade -y
+sudo apt update && sudo apt upgrade -y
 
 # Instalar dependências básicas
-log "Instalando dependências básicas..."
-apt install python3 python3-pip python3-venv nginx git curl openssl -y
+sudo apt install -y python3 python3-pip python3-venv git nginx sqlite3 fail2ban ufw curl
 
-# Criar usuário para a aplicação (se não existir)
-if ! id "grafeno" &>/dev/null; then
-    log "Criando usuário grafeno..."
-    useradd -m -s /bin/bash grafeno
+# Instalar Ansible e bibliotecas Python necessárias
+sudo pip3 install --upgrade pip
+sudo pip3 install ansible paramiko netmiko flask flask-login flask-bcrypt flask-wtf flask_sqlalchemy cryptography
+
+# Criar usuário ansitrix para rodar a aplicação
+if ! id -u ansitrix >/dev/null 2>&1; then
+    sudo useradd -m -s /bin/bash ansitrix
 fi
 
-# Criar diretório da aplicação
-APP_DIR="/opt/grafeno_automate"
-log "Criando diretório da aplicação em $APP_DIR..."
-mkdir -p $APP_DIR
+# Criar diretórios da aplicação
+APP_DIR="/opt/ansitrix"
+sudo mkdir -p $APP_DIR
+sudo chown ansitrix:ansitrix $APP_DIR
+
+# Estrutura de pastas
+sudo -u ansitrix mkdir -p $APP_DIR/{templates,static/css,static/js,logs,ansible,backups}
+
+echo "Parte 1 concluída: sistema atualizado e estrutura criada."
+
+# ==========================================
+# PARTE 2: BACKEND PYTHON
+# ==========================================
+
+echo "Parte 2: Criando ambiente virtual e backend Python..."
+
 cd $APP_DIR
 
-# Gerar chave secreta para Flask
-SECRET_KEY=$(openssl rand -hex 32)
-log "Chave secreta gerada"
+# Criar ambiente virtual Python
+sudo -u ansitrix python3 -m venv venv
+sudo -u ansitrix ./venv/bin/pip install --upgrade pip
+sudo -u ansitrix ./venv/bin/pip install ansible paramiko netmiko flask flask-login flask-bcrypt flask-wtf flask_sqlalchemy cryptography
 
-# Gerar senha forte para admin
-ADMIN_PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-12)
-log "Senha do admin gerada: $ADMIN_PASSWORD"
-
-# Criar ambiente virtual
-log "Criando ambiente virtual Python..."
-python3 -m venv venv
-source venv/bin/activate
-
-# Criar requirements.txt
-log "Criando requirements.txt..."
-cat > requirements.txt << EOF
-flask==2.3.3
-flask-login==0.6.3
-flask_sqlalchemy==3.0.5
-ansible==8.5.0
-netmiko==4.2.0
-paramiko==3.3.1
-gunicorn==21.2.0
-bcrypt==4.0.1
-werkzeug==2.3.7
-EOF
-
-# Instalar dependências Python
-log "Instalando dependências Python..."
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Criar estrutura de diretórios
-log "Criando estrutura de diretórios..."
-mkdir -p templates static/css static/js ansible_playbooks logs
-
-# Criar aplicação principal
-log "Criando aplicação principal..."
-cat > app.py << 'EOF'
-from flask import Flask, render_template, redirect, url_for, request, flash, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, login_user, login_required, logout_user, UserMixin, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
-from netmiko import ConnectHandler
+# Criar arquivo principal app.py
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/app.py > /dev/null
 import os
-import logging
-from datetime import datetime
 import subprocess
-import json
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from flask_bcrypt import Bcrypt
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, SubmitField, SelectField, IntegerField, TextAreaField
+from wtforms.validators import DataRequired, Length, EqualTo, ValidationError, NumberRange
+from cryptography.fernet import Fernet
+import base64
 
-# Configuração da aplicação
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'fallback_secret_key')
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///grafeno_automate.db'
+app.config['SECRET_KEY'] = os.environ.get('ANSITRIX_SECRET_KEY', 'change_this_secret_key')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///ansitrix.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# Configuração de logs
-logging.basicConfig(
-    filename='logs/grafeno_automate.log',
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(name)s %(message)s'
-)
-
 db = SQLAlchemy(app)
+bcrypt = Bcrypt(app)
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = 'login'
 
-# Models
-class User(UserMixin, db.Model):
+FERNET_KEY = os.environ.get('ANSITRIX_FERNET_KEY')
+if not FERNET_KEY:
+    FERNET_KEY = base64.urlsafe_b64encode(os.urandom(32)).decode()
+fernet = Fernet(FERNET_KEY.encode())
+
+user_groups = db.Table('user_groups',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id')),
+    db.Column('group_id', db.Integer, db.ForeignKey('group.id'))
+)
+
+mikrotik_groups = db.Table('mikrotik_groups',
+    db.Column('mikrotik_id', db.Integer, db.ForeignKey('mikrotik.id')),
+    db.Column('group_id', db.Integer, db.ForeignKey('group.id'))
+)
+
+class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(150), unique=True, nullable=False)
-    password_hash = db.Column(db.String(150), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_login = db.Column(db.DateTime)
-
-    def set_password(self, password):
-        self.password_hash = generate_password_hash(password)
+    password_hash = db.Column(db.String(128), nullable=False)
+    role = db.Column(db.String(50), default='user')
+    groups = db.relationship('Group', secondary=user_groups, backref='users')
 
     def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
+        return bcrypt.check_password_hash(self.password_hash, password)
+
+    def set_password(self, password):
+        self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
+
+class Group(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(150), unique=True, nullable=False)
 
 class Mikrotik(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(150), nullable=False)
-    ip = db.Column(db.String(100), nullable=False)
-    username = db.Column(db.String(100), nullable=False)
-    password = db.Column(db.String(100), nullable=False)
-    grupo_id = db.Column(db.Integer, db.ForeignKey('grupo.id'))
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    status = db.Column(db.String(20), default='unknown')
+    ip = db.Column(db.String(45), nullable=False)
+    ssh_port = db.Column(db.Integer, default=22)
+    ssh_user = db.Column(db.String(150), nullable=False)
+    ssh_password_encrypted = db.Column(db.LargeBinary, nullable=False)
+    groups = db.relationship('Group', secondary=mikrotik_groups, backref='mikrotiks')
 
-class Grupo(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(150), nullable=False)
-    description = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    mikrotiks = db.relationship('Mikrotik', backref='grupo', lazy=True)
+    def set_password(self, password):
+        self.ssh_password_encrypted = fernet.encrypt(password.encode())
 
-class ComandoRapido(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(150), nullable=False)
-    command = db.Column(db.Text, nullable=False)
-    description = db.Column(db.Text)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    def get_password(self):
+        return fernet.decrypt(self.ssh_password_encrypted).decode()
 
-class LogExecucao(db.Model):
+class Command(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    mikrotik_id = db.Column(db.Integer, db.ForeignKey('mikrotik.id'))
-    comando_id = db.Column(db.Integer, db.ForeignKey('comando_rapido.id'))
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    output = db.Column(db.Text)
-    status = db.Column(db.String(20))
-    executed_at = db.Column(db.DateTime, default=datetime.utcnow)
+    name = db.Column(db.String(150), unique=True, nullable=False)
+    command_text = db.Column(db.Text, nullable=False)
+
+class LoginForm(FlaskForm):
+    username = StringField('Usuário', validators=[DataRequired()])
+    password = PasswordField('Senha', validators=[DataRequired()])
+    submit = SubmitField('Entrar')
+
+class RegisterUserForm(FlaskForm):
+    username = StringField('Usuário', validators=[DataRequired(), Length(min=3, max=150)])
+    password = PasswordField('Senha', validators=[DataRequired(), Length(min=6)])
+    password2 = PasswordField('Confirme a Senha', validators=[DataRequired(), EqualTo('password')])
+    role = SelectField('Permissão', choices=[('admin', 'Administrador'), ('user', 'Usuário')])
+    submit = SubmitField('Cadastrar')
+
+    def validate_username(self, username):
+        user = User.query.filter_by(username=username.data).first()
+        if user:
+            raise ValidationError('Usuário já existe.')
+
+class MikrotikForm(FlaskForm):
+    name = StringField('Nome do Mikrotik', validators=[DataRequired()])
+    ip = StringField('IP', validators=[DataRequired()])
+    ssh_port = IntegerField('Porta SSH', default=22, validators=[NumberRange(min=1, max=65535)])
+    ssh_user = StringField('Usuário SSH', validators=[DataRequired()])
+    ssh_password = PasswordField('Senha SSH', validators=[DataRequired()])
+    groups = StringField('Grupos (separados por vírgula)')
+    submit = SubmitField('Salvar')
+
+class CommandForm(FlaskForm):
+    name = StringField('Nome do Comando', validators=[DataRequired()])
+    command_text = TextAreaField('Comando', validators=[DataRequired()])
+    submit = SubmitField('Salvar')
 
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
 
+@app.route('/')
+@login_required
+def index():
+    return render_template('index.html', user=current_user)
+
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if request.method == 'POST':
-        user = User.query.filter_by(username=request.form['username']).first()
-        if user and user.check_password(request.form['password']):
-            user.last_login = datetime.utcnow()
-            db.session.commit()
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(username=form.username.data).first()
+        if user and user.check_password(form.password.data):
             login_user(user)
-            app.logger.info(f'Login realizado: {user.username}')
-            return redirect(url_for('dashboard'))
-        flash('Usuário ou senha inválidos', 'error')
-        app.logger.warning(f'Tentativa de login inválida: {request.form["username"]}')
-    return render_template('login.html')
+            return redirect(url_for('index'))
+        else:
+            flash('Usuário ou senha inválidos.', 'danger')
+    return render_template('login.html', form=form)
 
 @app.route('/logout')
 @login_required
 def logout():
-    app.logger.info(f'Logout realizado: {current_user.username}')
     logout_user()
     return redirect(url_for('login'))
 
-@app.route('/')
+@app.route('/users')
 @login_required
-def dashboard():
-    mikrotiks = Mikrotik.query.all()
-    grupos = Grupo.query.all()
-    comandos = ComandoRapido.query.all()
-    logs_recentes = LogExecucao.query.order_by(LogExecucao.executed_at.desc()).limit(10).all()
-    
-    stats = {
-        'total_mikrotiks': len(mikrotiks),
-        'total_grupos': len(grupos),
-        'total_comandos': len(comandos)
-    }
-    
-    return render_template('dashboard.html', 
-                         mikrotiks=mikrotiks, 
-                         grupos=grupos, 
-                         comandos=comandos,
-                         logs_recentes=logs_recentes,
-                         stats=stats)
+def users():
+    if current_user.role != 'admin':
+        flash('Acesso negado.', 'danger')
+        return redirect(url_for('index'))
+    users = User.query.all()
+    return render_template('users.html', users=users)
 
-@app.route('/mikrotik/add', methods=['GET', 'POST'])
+@app.route('/users/add', methods=['GET', 'POST'])
+@login_required
+def add_user():
+    if current_user.role != 'admin':
+        flash('Acesso negado.', 'danger')
+        return redirect(url_for('index'))
+    form = RegisterUserForm()
+    if form.validate_on_submit():
+        user = User(username=form.username.data, role=form.role.data)
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('Usuário cadastrado com sucesso.', 'success')
+        return redirect(url_for('users'))
+    return render_template('add_user.html', form=form)
+
+@app.route('/mikrotiks')
+@login_required
+def mikrotiks():
+    mikrotiks = Mikrotik.query.all()
+    return render_template('mikrotiks.html', mikrotiks=mikrotiks)
+
+@app.route('/mikrotiks/add', methods=['GET', 'POST'])
 @login_required
 def add_mikrotik():
-    if request.method == 'POST':
-        m = Mikrotik(
-            name=request.form['name'],
-            ip=request.form['ip'],
-            username=request.form['username'],
-            password=request.form['password'],
-            grupo_id=request.form.get('grupo_id') if request.form.get('grupo_id') else None
+    if current_user.role != 'admin':
+        flash('Acesso negado.', 'danger')
+        return redirect(url_for('index'))
+    form = MikrotikForm()
+    if form.validate_on_submit():
+        mikrotik = Mikrotik(
+            name=form.name.data,
+            ip=form.ip.data,
+            ssh_port=form.ssh_port.data,
+            ssh_user=form.ssh_user.data
         )
-        db.session.add(m)
+        mikrotik.set_password(form.ssh_password.data)
+        if form.groups.data:
+            group_names = [g.strip() for g in form.groups.data.split(',') if g.strip()]
+            for gname in group_names:
+                group = Group.query.filter_by(name=gname).first()
+                if not group:
+                    group = Group(name=gname)
+                    db.session.add(group)
+                mikrotik.groups.append(group)
+        db.session.add(mikrotik)
         db.session.commit()
-        flash('Mikrotik adicionado com sucesso!', 'success')
-        app.logger.info(f'Mikrotik adicionado: {m.name} ({m.ip}) por {current_user.username}')
-        return redirect(url_for('dashboard'))
-    
-    grupos = Grupo.query.all()
-    return render_template('add_mikrotik.html', grupos=grupos)
+        flash('Mikrotik cadastrado com sucesso.', 'success')
+        return redirect(url_for('mikrotiks'))
+    return render_template('add_mikrotik.html', form=form)
 
-@app.route('/grupo/add', methods=['GET', 'POST'])
+@app.route('/commands')
 @login_required
-def add_grupo():
+def commands():
+    commands = Command.query.all()
+    return render_template('commands.html', commands=commands)
+
+@app.route('/commands/add', methods=['GET', 'POST'])
+@login_required
+def add_command():
+    if current_user.role != 'admin':
+        flash('Acesso negado.', 'danger')
+        return redirect(url_for('index'))
+    form = CommandForm()
+    if form.validate_on_submit():
+        cmd = Command(name=form.name.data, command_text=form.command_text.data)
+        db.session.add(cmd)
+        db.session.commit()
+        flash('Comando cadastrado com sucesso.', 'success')
+        return redirect(url_for('commands'))
+    return render_template('add_command.html', form=form)
+
+@app.route('/execute', methods=['GET', 'POST'])
+@login_required
+def execute():
     if request.method == 'POST':
-        g = Grupo(
-            name=request.form['name'],
-            description=request.form.get('description', '')
-        )
-        db.session.add(g)
-        db.session.commit()
-        flash('Grupo criado com sucesso!', 'success')
-        app.logger.info(f'Grupo criado: {g.name} por {current_user.username}')
-        return redirect(url_for('dashboard'))
-    return render_template('add_grupo.html')
+        mikrotik_id = request.form.get('mikrotik_id')
+        command_id = request.form.get('command_id')
+        mikrotik = Mikrotik.query.get(mikrotik_id)
+        command = Command.query.get(command_id)
+        if not mikrotik or not command:
+            return jsonify({'status': 'error', 'message': 'Mikrotik ou comando inválido.'})
+        result = run_ansible_command(mikrotik, command.command_text)
+        return jsonify({'status': 'success', 'output': result})
+    else:
+        mikrotiks = Mikrotik.query.all()
+        commands = Command.query.all()
+        return render_template('execute.html', mikrotiks=mikrotiks, commands=commands)
 
-@app.route('/comando/add', methods=['GET', 'POST'])
-@login_required
-def add_comando():
-    if request.method == 'POST':
-        c = ComandoRapido(
-            name=request.form['name'],
-            command=request.form['command'],
-            description=request.form.get('description', '')
-        )
-        db.session.add(c)
-        db.session.commit()
-        flash('Comando rápido adicionado com sucesso!', 'success')
-        app.logger.info(f'Comando adicionado: {c.name} por {current_user.username}')
-        return redirect(url_for('dashboard'))
-    return render_template('add_comando.html')
+def run_ansible_command(mikrotik, command_text):
+    inventory_path = os.path.join(app.root_path, 'ansible', 'inventory.ini')
+    with open(inventory_path, 'w') as f:
+        f.write(f"[mikrotiks]\n{mikrotik.ip} ansible_port={mikrotik.ssh_port} ansible_user={mikrotik.ssh_user} ansible_ssh_pass={mikrotik.get_password()} ansible_connection=ssh ansible_python_interpreter=/usr/bin/python3\n")
 
-@app.route('/executar/<int:mikrotik_id>/<int:comando_id>')
-@login_required
-def executar(mikrotik_id, comando_id):
-    mikrotik = Mikrotik.query.get_or_404(mikrotik_id)
-    comando = ComandoRapido.query.get_or_404(comando_id)
+    playbook_path = os.path.join(app.root_path, 'ansible', 'playbook.yml')
+    playbook_content = f"""---
+- hosts: mikrotiks
+  gather_facts: no
+  tasks:
+    - name: Executar comando Mikrotik
+      ansible.builtin.raw: '{command_text}'
+      register: output
+    - name: Mostrar resultado
+      debug:
+        var: output.stdout
+"""
+    with open(playbook_path, 'w') as f:
+        f.write(playbook_content)
 
-    device = {
-        'device_type': 'mikrotik_routeros',
-        'host': mikrotik.ip,
-        'username': mikrotik.username,
-        'password': mikrotik.password,
-        'timeout': 20,
-        'session_timeout': 60
-    }
-    
-    log_exec = LogExecucao(
-        mikrotik_id=mikrotik_id,
-        comando_id=comando_id,
-        user_id=current_user.id
-    )
-    
+    cmd = f"./venv/bin/ansible-playbook -i {inventory_path} {playbook_path} --ssh-extra-args='-o StrictHostKeyChecking=no'"
+
     try:
-        net_connect = ConnectHandler(**device)
-        output = net_connect.send_command(comando.command)
-        net_connect.disconnect()
-        
-        log_exec.output = output
-        log_exec.status = 'success'
-        
-        flash(f'Comando "{comando.name}" executado com sucesso em {mikrotik.name}!', 'success')
-        app.logger.info(f'Comando executado: {comando.name} em {mikrotik.name} por {current_user.username}')
-        
+        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, cwd=app.root_path, timeout=60)
+        return output.decode()
+    except subprocess.CalledProcessError as e:
+        return e.output.decode()
     except Exception as e:
-        log_exec.output = str(e)
-        log_exec.status = 'error'
-        
-        flash(f'Erro ao executar comando em {mikrotik.name}: {str(e)}', 'error')
-        app.logger.error(f'Erro ao executar comando: {comando.name} em {mikrotik.name} - {str(e)}')
-    
-    db.session.add(log_exec)
-    db.session.commit()
-    
-    return redirect(url_for('dashboard'))
+        return str(e)
 
-@app.route('/mikrotik/<int:mikrotik_id>/delete')
-@login_required
-def delete_mikrotik(mikrotik_id):
-    mikrotik = Mikrotik.query.get_or_404(mikrotik_id)
-    name = mikrotik.name
-    db.session.delete(mikrotik)
-    db.session.commit()
-    flash(f'Mikrotik "{name}" removido com sucesso!', 'success')
-    app.logger.info(f'Mikrotik removido: {name} por {current_user.username}')
-    return redirect(url_for('dashboard'))
-
-@app.route('/comando/<int:comando_id>/delete')
-@login_required
-def delete_comando(comando_id):
-    comando = ComandoRapido.query.get_or_404(comando_id)
-    name = comando.name
-    db.session.delete(comando)
-    db.session.commit()
-    flash(f'Comando "{name}" removido com sucesso!', 'success')
-    app.logger.info(f'Comando removido: {name} por {current_user.username}')
-    return redirect(url_for('dashboard'))
+def create_tables():
+    with app.app_context():
+        db.create_all()
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin = User(username='admin', role='admin')
+            admin.set_password('ansitrix123')
+            db.session.add(admin)
+            db.session.commit()
 
 if __name__ == '__main__':
+    create_tables()
     app.run(host='0.0.0.0', port=5000, debug=False)
 EOF
 
-# Criar templates HTML
-log "Criando templates HTML..."
+echo "Parte 2 concluída: backend Python criado."
+
+# ==========================================
+# PARTE 3: TEMPLATES HTML E CSS
+# ==========================================
+
+echo "Parte 3: Criando templates HTML e CSS..."
 
 # Base template
-cat > templates/base.html << 'EOF'
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/base.html > /dev/null
 <!DOCTYPE html>
-<html lang="pt-br">
+<html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}Grafeno Automate{% endblock %}</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/grafeno.css') }}">
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ansitrix - {% block title %}{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}" />
+    <script>
+        function toggleTheme() {
+            const body = document.body;
+            if(body.classList.contains('dark')) {
+                body.classList.remove('dark');
+                localStorage.setItem('theme', 'light');
+            } else {
+                body.classList.add('dark');
+                localStorage.setItem('theme', 'dark');
+            }
+        }
+        window.onload = function() {
+            if(localStorage.getItem('theme') === 'dark') {
+                document.body.classList.add('dark');
+            }
+        }
+    </script>
 </head>
 <body>
-    <div class="container-fluid">
-        {% if current_user.is_authenticated %}
-        <nav class="navbar navbar-expand-lg navbar-dark bg-grafeno mb-4">
-            <div class="container">
-                <a class="navbar-brand fw-bold" href="{{ url_for('dashboard') }}">GRAFENO AUTOMATE</a>
-                <div class="navbar-nav ms-auto">
-                    <span class="navbar-text me-3">Olá, {{ current_user.username }}</span>
-                    <a class="btn btn-outline-light btn-sm" href="{{ url_for('logout') }}">Sair</a>
-                </div>
-            </div>
-        </nav>
-        {% endif %}
-
-        {% with messages = get_flashed_messages(with_categories=true) %}
-            {% if messages %}
-                {% for category, message in messages %}
-                    <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} alert-dismissible fade show" role="alert">
-                        {{ message }}
-                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                    </div>
-                {% endfor %}
+    <nav>
+        <div class="logo">
+            <svg width="40" height="40" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="32" cy="32" r="30" stroke="#007ACC" stroke-width="3"/>
+                <path d="M10 54L54 10" stroke="#007ACC" stroke-width="3" stroke-linecap="round"/>
+                <circle cx="54" cy="10" r="6" fill="#007ACC"/>
+                <path d="M40 24L54 10L48 16" stroke="#007ACC" stroke-width="2" stroke-linejoin="round"/>
+            </svg>
+            <span>Ansitrix</span>
+        </div>
+        <ul>
+            {% if current_user.is_authenticated %}
+            <li><a href="{{ url_for('index') }}">Início</a></li>
+            <li><a href="{{ url_for('mikrotiks') }}">Mikrotiks</a></li>
+            <li><a href="{{ url_for('commands') }}">Comandos</a></li>
+            {% if current_user.role == 'admin' %}
+            <li><a href="{{ url_for('users') }}">Usuários</a></li>
             {% endif %}
+            <li><a href="{{ url_for('execute') }}">Executar</a></li>
+            <li><a href="{{ url_for('logout') }}">Sair</a></li>
+            {% else %}
+            <li><a href="{{ url_for('login') }}">Login</a></li>
+            {% endif %}
+            <li><button onclick="toggleTheme()" class="btn-theme">Tema</button></li>
+        </ul>
+    </nav>
+    <main>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            <div class="flash-messages">
+              {% for category, message in messages %}
+                <div class="flash {{ category }}">{{ message }}</div>
+              {% endfor %}
+            </div>
+          {% endif %}
         {% endwith %}
-
         {% block content %}{% endblock %}
-    </div>
-
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    </main>
 </body>
 </html>
 EOF
 
-# Login template
-cat > templates/login.html << 'EOF'
+# Login page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/login.html > /dev/null
 {% extends "base.html" %}
-{% block title %}Login - Grafeno Automate{% endblock %}
-
+{% block title %}Login{% endblock %}
 {% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-6 col-lg-4">
-        <div class="card shadow grafeno-card">
-            <div class="card-body">
-                <div class="text-center mb-4">
-                    <h2 class="card-title text-grafeno fw-bold">GRAFENO AUTOMATE</h2>
-                    <p class="text-muted">Sistema de Gerenciamento Mikrotik</p>
-                </div>
-                <form method="POST">
-                    <div class="mb-3">
-                        <label for="username" class="form-label">Usuário</label>
-                        <input type="text" class="form-control" id="username" name="username" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="password" class="form-label">Senha</label>
-                        <input type="password" class="form-control" id="password" name="password" required>
-                    </div>
-                    <button type="submit" class="btn btn-grafeno w-100">Entrar</button>
-                </form>
-            </div>
+<div class="login-container">
+    <h2>Login no Ansitrix</h2>
+    <form method="POST" action="{{ url_for('login') }}">
+        {{ form.hidden_tag() }}
+        <div class="form-group">
+            <label for="username">Usuário</label>
+            {{ form.username(class="form-control") }}
         </div>
-    </div>
+        <div class="form-group">
+            <label for="password">Senha</label>
+            {{ form.password(class="form-control") }}
+        </div>
+        {{ form.submit(class="btn btn-primary") }}
+    </form>
 </div>
 {% endblock %}
 EOF
 
-# Dashboard template
-cat > templates/dashboard.html << 'EOF'
+# Index page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/index.html > /dev/null
 {% extends "base.html" %}
-{% block title %}Dashboard - Grafeno Automate{% endblock %}
-
+{% block title %}Início{% endblock %}
 {% block content %}
-<div class="row mb-4">
-    <div class="col-md-4">
-        <div class="card bg-grafeno text-white">
-            <div class="card-body">
-                <h5 class="card-title">Mikrotiks</h5>
-                <h2>{{ stats.total_mikrotiks }}</h2>
-            </div>
-        </div>
-    </div>
-    <div class="col-md-4">
-        <div class="card bg-secondary text-white">
-            <div class="card-body">
-                <h5 class="card-title">Grupos</h5>
-                <h2>{{ stats.total_grupos }}</h2>
-            </div>
-        </div>
-    </div>
-    <div class="col-md-4">
-        <div class="card bg-info text-white">
-            <div class="card-body">
-                <h5 class="card-title">Comandos</h5>
-                <h2>{{ stats.total_comandos }}</h2>
-            </div>
-        </div>
-    </div>
-</div>
-
-<div class="row">
-    <div class="col-md-6">
+<div class="dashboard">
+    <h1>Bem-vindo ao Ansitrix</h1>
+    <p>Sistema de gerenciamento centralizado de Mikrotiks via Ansible</p>
+    
+    <div class="dashboard-cards">
         <div class="card">
-            <div class="card-header d-flex justify-content-between">
-                <h5>Mikrotiks</h5>
-                <a href="{{ url_for('add_mikrotik') }}" class="btn btn-primary btn-sm">Adicionar</a>
-            </div>
-            <div class="card-body">
-                {% if mikrotiks %}
-                    {% for m in mikrotiks %}
-                    <div class="d-flex justify-content-between align-items-center border-bottom py-2">
-                        <div>
-                            <strong>{{ m.name }}</strong><br>
-                            <small class="text-muted">{{ m.ip }}{% if m.grupo %} - {{ m.grupo.name }}{% endif %}</small>
-                        </div>
-                        <div>
-                            {% for c in comandos %}
-                                <a href="{{ url_for('executar', mikrotik_id=m.id, comando_id=c.id) }}" 
-                                   class="btn btn-outline-primary btn-sm me-1">{{ c.name }}</a>
-                            {% endfor %}
-                            <a href="{{ url_for('delete_mikrotik', mikrotik_id=m.id) }}" 
-                               class="btn btn-outline-danger btn-sm"
-                               onclick="return confirm('Tem certeza?')">Remover</a>
-                        </div>
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p class="text-muted">Nenhum Mikrotik cadastrado</p>
-                {% endif %}
-            </div>
-        </div>
-    </div>
-
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header d-flex justify-content-between">
-                <h5>Comandos Rápidos</h5>
-                <a href="{{ url_for('add_comando') }}" class="btn btn-primary btn-sm">Adicionar</a>
-            </div>
-            <div class="card-body">
-                {% if comandos %}
-                    {% for c in comandos %}
-                    <div class="d-flex justify-content-between align-items-center border-bottom py-2">
-                        <div>
-                            <strong>{{ c.name }}</strong><br>
-                            <small class="text-muted">{{ c.command[:50] }}...</small>
-                        </div>
-                        <a href="{{ url_for('delete_comando', comando_id=c.id) }}" 
-                           class="btn btn-outline-danger btn-sm"
-                           onclick="return confirm('Tem certeza?')">Remover</a>
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p class="text-muted">Nenhum comando cadastrado</p>
-                {% endif %}
-            </div>
-        </div>
-
-        <div class="card mt-3">
-            <div class="card-header d-flex justify-content-between">
-                <h5>Grupos</h5>
-                <a href="{{ url_for('add_grupo') }}" class="btn btn-primary btn-sm">Adicionar</a>
-            </div>
-            <div class="card-body">
-                {% if grupos %}
-                    {% for g in grupos %}
-                    <div class="border-bottom py-2">
-                        <strong>{{ g.name }}</strong> ({{ g.mikrotiks|length }} mikrotiks)
-                        {% if g.description %}<br><small class="text-muted">{{ g.description }}</small>{% endif %}
-                    </div>
-                    {% endfor %}
-                {% else %}
-                    <p class="text-muted">Nenhum grupo cadastrado</p>
-                {% endif %}
-            </div>
-        </div>
-    </div>
-</div>
-{% endblock %}
-EOF
-
-# Add Mikrotik template
-cat > templates/add_mikrotik.html << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Mikrotik - Grafeno Automate{% endblock %}
-
-{% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header">
-                <h5>Adicionar Mikrotik</h5>
-            </div>
-            <div class="card-body">
-                <form method="POST">
-                    <div class="mb-3">
-                        <label for="name" class="form-label">Nome</label>
-                        <input type="text" class="form-control" id="name" name="name" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="ip" class="form-label">IP</label>
-                        <input type="text" class="form-control" id="ip" name="ip" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="username" class="form-label">Usuário</label>
-                        <input type="text" class="form-control" id="username" name="username" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="password" class="form-label">Senha</label>
-                        <input type="password" class="form-control" id="password" name="password" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="grupo_id" class="form-label">Grupo (opcional)</label>
-                        <select class="form-control" id="grupo_id" name="grupo_id">
-                            <option value="">Selecione um grupo</option>
-                            {% for grupo in grupos %}
-                                <option value="{{ grupo.id }}">{{ grupo.name }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="d-flex gap-2">
-                        <button type="submit" class="btn btn-primary">Salvar</button>
-                        <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-</div>
-{% endblock %}
-EOF
-
-# Add Grupo template
-cat > templates/add_grupo.html << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Grupo - Grafeno Automate{% endblock %}
-
-{% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-6">
-        <div class="card">
-            <div class="card-header">
-                <h5>Adicionar Grupo</h5>
-            </div>
-            <div class="card-body">
-                <form method="POST">
-                    <div class="mb-3">
-                        <label for="name" class="form-label">Nome</label>
-                        <input type="text" class="form-control" id="name" name="name" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="description" class="form-label">Descrição</label>
-                        <textarea class="form-control" id="description" name="description" rows="3"></textarea>
-                    </div>
-                    <div class="d-flex gap-2">
-                        <button type="submit" class="btn btn-primary">Salvar</button>
-                        <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-</div>
-{% endblock %}
-EOF
-
-# Add Comando template
-cat > templates/add_comando.html << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Comando - Grafeno Automate{% endblock %}
-
-{% block content %}
-<div class="row justify-content-center">
-    <div class="col-md-8">
-        <div class="card">
-            <div class="card-header">
-                <h5>Adicionar Comando Rápido</h5>
-            </div>
-            <div class="card-body">
-                <form method="POST">
-                    <div class="mb-3">
-                        <label for="name" class="form-label">Nome</label>
-                        <input type="text" class="form-control" id="name" name="name" required>
-                    </div>
-                    <div class="mb-3">
-                        <label for="command" class="form-label">Comando RouterOS</label>
-                        <textarea class="form-control" id="command" name="command" rows="4" required></textarea>
-                        <small class="form-text text-muted">Exemplo: /system reboot</small>
-                    </div>
-                    <div class="mb-3">
-                        <label for="description" class="form-label">Descrição</label>
-                        <textarea class="form-control" id="description" name="description" rows="2"></textarea>
-                    </div>
-                    <div class="d-flex gap-2">
-                        <button type="submit" class="btn btn-primary">Salvar</button>
-                        <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-                    </div>
-                </form>
-            </div>
+            <h3>Mikrotiks</h3>
+            <p>Gerencie seus equipamentos Mikrotik</p>
+            <a href="{{ url_for('mikrotiks') }}" class="btn">Acessar</a>
         </div>
         
-        <div class="card mt-4">
-            <div class="card-header">
-                <h6>Comandos Sugeridos</h6>
-            </div>
-            <div class="card-body">
-                <div class="row">
-                    <div class="col-md-6">
-                        <strong>Reboot</strong><br>
-                        <code>/system reboot</code>
-                    </div>
-                    <div class="col-md-6">
-                        <strong>Export Config</strong><br>
-                        <code>/export file=backup</code>
-                    </div>
-                </div>
-                <div class="row mt-2">
-                    <div class="col-md-6">
-                        <strong>Add User</strong><br>
-                        <code>/user add name=novo_user group=read password=senha123</code>
-                    </div>
-                    <div class="col-md-6">
-                        <strong>Show Users</strong><br>
-                        <code>/user print</code>
-                    </div>
-                </div>
-            </div>
+        <div class="card">
+            <h3>Comandos</h3>
+            <p>Configure comandos predefinidos</p>
+            <a href="{{ url_for('commands') }}" class="btn">Acessar</a>
         </div>
+        
+        <div class="card">
+            <h3>Executar</h3>
+            <p>Execute comandos nos equipamentos</p>
+            <a href="{{ url_for('execute') }}" class="btn btn-primary">Executar</a>
+        </div>
+        
+        {% if current_user.role == 'admin' %}
+        <div class="card">
+            <h3>Usuários</h3>
+            <p>Gerencie usuários do sistema</p>
+            <a href="{{ url_for('users') }}" class="btn">Acessar</a>
+        </div>
+        {% endif %}
     </div>
 </div>
 {% endblock %}
 EOF
 
-# Criar CSS
-log "Criando arquivos CSS..."
-cat > static/css/grafeno.css << 'EOF'
+# Users page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/users.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Usuários{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h2>Usuários</h2>
+    <a href="{{ url_for('add_user') }}" class="btn btn-primary">Adicionar Usuário</a>
+</div>
+
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Usuário</th>
+            <th>Permissão</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for user in users %}
+        <tr>
+            <td>{{ user.id }}</td>
+            <td>{{ user.username }}</td>
+            <td>{{ user.role }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+EOF
+
+# Add user page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/add_user.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Adicionar Usuário{% endblock %}
+{% block content %}
+<h2>Adicionar Usuário</h2>
+<form method="POST" action="{{ url_for('add_user') }}">
+    {{ form.hidden_tag() }}
+    
+    <div class="form-group">
+        <label for="username">{{ form.username.label }}</label>
+        {{ form.username(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="password">{{ form.password.label }}</label>
+        {{ form.password(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="password2">{{ form.password2.label }}</label>
+        {{ form.password2(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="role">{{ form.role.label }}</label>
+        {{ form.role(class="form-control") }}
+    </div>
+    
+    {{ form.submit(class="btn btn-primary") }}
+    <a href="{{ url_for('users') }}" class="btn btn-secondary">Cancelar</a>
+</form>
+{% endblock %}
+EOF
+
+# Mikrotiks page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/mikrotiks.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Mikrotiks{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h2>Mikrotiks</h2>
+    {% if current_user.role == 'admin' %}
+    <a href="{{ url_for('add_mikrotik') }}" class="btn btn-primary">Adicionar Mikrotik</a>
+    {% endif %}
+</div>
+
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Nome</th>
+            <th>IP</th>
+            <th>Porta SSH</th>
+            <th>Usuário</th>
+            <th>Grupos</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for mikrotik in mikrotiks %}
+        <tr>
+            <td>{{ mikrotik.id }}</td>
+            <td>{{ mikrotik.name }}</td>
+            <td>{{ mikrotik.ip }}</td>
+            <td>{{ mikrotik.ssh_port }}</td>
+            <td>{{ mikrotik.ssh_user }}</td>
+            <td>
+                {% for group in mikrotik.groups %}
+                    <span class="badge">{{ group.name }}</span>
+                {% endfor %}
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+EOF
+
+# Add mikrotik page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/add_mikrotik.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Adicionar Mikrotik{% endblock %}
+{% block content %}
+<h2>Adicionar Mikrotik</h2>
+<form method="POST" action="{{ url_for('add_mikrotik') }}">
+    {{ form.hidden_tag() }}
+    
+    <div class="form-group">
+        <label for="name">{{ form.name.label }}</label>
+        {{ form.name(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="ip">{{ form.ip.label }}</label>
+        {{ form.ip(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="ssh_port">{{ form.ssh_port.label }}</label>
+        {{ form.ssh_port(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="ssh_user">{{ form.ssh_user.label }}</label>
+        {{ form.ssh_user(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="ssh_password">{{ form.ssh_password.label }}</label>
+        {{ form.ssh_password(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="groups">{{ form.groups.label }}</label>
+        {{ form.groups(class="form-control", placeholder="Ex: producao, backup") }}
+        <small>Separe os grupos por vírgula</small>
+    </div>
+    
+    {{ form.submit(class="btn btn-primary") }}
+    <a href="{{ url_for('mikrotiks') }}" class="btn btn-secondary">Cancelar</a>
+</form>
+{% endblock %}
+EOF
+
+# Commands page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/commands.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Comandos{% endblock %}
+{% block content %}
+<div class="page-header">
+    <h2>Comandos</h2>
+    {% if current_user.role == 'admin' %}
+    <a href="{{ url_for('add_command') }}" class="btn btn-primary">Adicionar Comando</a>
+    {% endif %}
+</div>
+
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>ID</th>
+            <th>Nome</th>
+            <th>Comando</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for command in commands %}
+        <tr>
+            <td>{{ command.id }}</td>
+            <td>{{ command.name }}</td>
+            <td><code>{{ command.command_text[:50] }}{% if command.command_text|length > 50 %}...{% endif %}</code></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+EOF
+
+# Add command page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/add_command.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Adicionar Comando{% endblock %}
+{% block content %}
+<h2>Adicionar Comando</h2>
+<form method="POST" action="{{ url_for('add_command') }}">
+    {{ form.hidden_tag() }}
+    
+    <div class="form-group">
+        <label for="name">{{ form.name.label }}</label>
+        {{ form.name(class="form-control") }}
+    </div>
+    
+    <div class="form-group">
+        <label for="command_text">{{ form.command_text.label }}</label>
+        {{ form.command_text(class="form-control", rows="5") }}
+    </div>
+    
+    {{ form.submit(class="btn btn-primary") }}
+    <a href="{{ url_for('commands') }}" class="btn btn-secondary">Cancelar</a>
+</form>
+
+<div class="command-examples">
+    <h3>Exemplos de Comandos Importantes:</h3>
+    <ul>
+        <li><strong>Reboot:</strong> <code>/system reboot</code></li>
+        <li><strong>Export Config:</strong> <code>/export</code></li>
+        <li><strong>Add User:</strong> <code>/user add name=usuario password=senha group=full</code></li>
+        <li><strong>Remove User:</strong> <code>/user remove usuario</code></li>
+        <li><strong>List Interfaces:</strong> <code>/interface print</code></li>
+        <li><strong>System Info:</strong> <code>/system resource print</code></li>
+    </ul>
+</div>
+{% endblock %}
+EOF
+
+# Execute page
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/templates/execute.html > /dev/null
+{% extends "base.html" %}
+{% block title %}Executar Comandos{% endblock %}
+{% block content %}
+<h2>Executar Comandos</h2>
+
+<form id="executeForm">
+    <div class="form-group">
+        <label for="mikrotik">Selecionar Mikrotik:</label>
+        <select name="mikrotik_id" id="mikrotik" class="form-control" required>
+            <option value="">Selecione um Mikrotik</option>
+            {% for mikrotik in mikrotiks %}
+            <option value="{{ mikrotik.id }}">{{ mikrotik.name }} ({{ mikrotik.ip }})</option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <div class="form-group">
+        <label for="command">Selecionar Comando:</label>
+        <select name="command_id" id="command" class="form-control" required>
+            <option value="">Selecione um comando</option>
+            {% for command in commands %}
+            <option value="{{ command.id }}">{{ command.name }}</option>
+            {% endfor %}
+        </select>
+    </div>
+    
+    <button type="submit" class="btn btn-primary">Executar</button>
+</form>
+
+<div id="output" class="output-container" style="display:none;">
+    <h3>Resultado da Execução:</h3>
+    <pre id="outputContent"></pre>
+</div>
+
+<script>
+document.getElementById('executeForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    
+    const formData = new FormData(this);
+    const outputDiv = document.getElementById('output');
+    const outputContent = document.getElementById('outputContent');
+    
+    outputDiv.style.display = 'block';
+    outputContent.textContent = 'Executando comando...';
+    
+    fetch('/execute', {
+        method: 'POST',
+        body: formData
+    })
+    .then(response => response.json())
+    .then(data => {
+        if (data.status === 'success') {
+            outputContent.textContent = data.output;
+        } else {
+            outputContent.textContent = 'Erro: ' + data.message;
+        }
+    })
+    .catch(error => {
+        outputContent.textContent = 'Erro de conexão: ' + error;
+    });
+});
+</script>
+{% endblock %}
+EOF
+
+# CSS profissional
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/static/css/style.css > /dev/null
 :root {
-    --grafeno-primary: #2c3e50;
-    --grafeno-secondary: #34495e;
-    --grafeno-accent: #3498db;
-    --grafeno-success: #27ae60;
-    --grafeno-warning: #f39c12;
-    --grafeno-danger: #e74c3c;
-    --grafeno-light: #ecf0f1;
-    --grafeno-dark: #2c3e50;
+    --primary-color: #007ACC;
+    --secondary-color: #005A9E;
+    --background-color: #FFFFFF;
+    --surface-color: #F8F9FA;
+    --text-color: #212529;
+    --text-secondary: #6C757D;
+    --border-color: #DEE2E6;
+    --shadow: 0 2px 8px rgba(0,0,0,0.1);
+    --success-color: #28A745;
+    --danger-color: #DC3545;
+    --warning-color: #FFC107;
+}
+
+body.dark {
+    --background-color: #1A1A1A;
+    --surface-color: #2D2D2D;
+    --text-color: #FFFFFF;
+    --text-secondary: #B0B0B0;
+    --border-color: #404040;
+    --shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
 }
 
 body {
-    background-color: #f8f9fa;
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    line-height: 1.6;
+    transition: all 0.3s ease;
 }
 
-.bg-grafeno {
-    background-color: var(--grafeno-primary) !important;
+nav {
+    background-color: var(--surface-color);
+    padding: 1rem 2rem;
+    box-shadow: var(--shadow);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border-color);
 }
 
-.text-grafeno {
-    color: var(--grafeno-primary) !important;
-}
-
-.btn-grafeno {
-    background-color: var(--grafeno-primary);
-    border-color: var(--grafeno-primary);
-    color: white;
-}
-
-.btn-grafeno:hover {
-    background-color: var(--grafeno-secondary);
-    border-color: var(--grafeno-secondary);
-    color: white;
-}
-
-.grafeno-card {
-    border: none;
-    border-radius: 10px;
-    margin-top: 100px;
-}
-
-.navbar-brand {
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
     font-size: 1.5rem;
-    letter-spacing: 1px;
+    font-weight: bold;
+    color: var(--primary-color);
 }
 
-.card {
+nav ul {
+    display: flex;
+    list-style: none;
+    gap: 1rem;
+    align-items: center;
+}
+
+nav a {
+    color: var(--text-color);
+    text-decoration: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    transition: all 0.2s ease;
+}
+
+nav a:hover {
+    background-color: var(--primary-color);
+    color: white;
+}
+
+.btn-theme {
+    background: var(--primary-color);
+    color: white;
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.btn-theme:hover {
+    background: var(--secondary-color);
+}
+
+main {
+    max-width: 1200px;
+    margin: 2rem auto;
+    padding: 0 2rem;
+}
+
+.btn {
+    display: inline-block;
+    padding: 0.75rem 1.5rem;
+    background-color: var(--primary-color);
+    color: white;
+    text-decoration: none;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 1rem;
+    transition: all 0.2s ease;
+    text-align: center;
+}
+
+.btn:hover {
+    background-color: var(--secondary-color);
+    transform: translateY(-1px);
+}
+
+.btn-primary { background-color: var(--primary-color); }
+.btn-secondary { background-color: var(--text-secondary); }
+.btn-success { background-color: var(--success-color); }
+.btn-danger { background-color: var(--danger-color); }
+
+.form-group {
+    margin-bottom: 1.5rem;
+}
+
+.form-group label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+    color: var(--text-color);
+}
+
+.form-control {
+    width: 100%;
+    padding: 0.75rem;
+    border: 2px solid var(--border-color);
+    border-radius: 6px;
+    background-color: var(--background-color);
+    color: var(--text-color);
+    font-size: 1rem;
+    transition: border-color 0.2s ease;
+}
+
+.form-control:focus {
+    outline: none;
+    border-color: var(--primary-color);
+    box-shadow: 0 0 0 3px rgba(0, 122, 204, 0.1);
+}
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    background-color: var(--surface-color);
     border-radius: 8px;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    overflow: hidden;
+    box-shadow: var(--shadow);
 }
 
-.card-header {
-    background-color: var(--grafeno-light);
-    border-bottom: 1px solid #dee2e6;
+.data-table th,
+.data-table td {
+    padding: 1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.data-table th {
+    background-color: var(--primary-color);
+    color: white;
     font-weight: 600;
 }
 
-.btn-outline-primary {
-    border-color: var(--grafeno-accent);
-    color: var(--grafeno-accent);
+.data-table tbody tr:hover {
+    background-color: var(--border-color);
 }
 
-.btn-outline-primary:hover {
-    background-color: var(--grafeno-accent);
-    border-color: var(--grafeno-accent);
+.dashboard-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 2rem;
+    margin-top: 2rem;
 }
 
-.alert-success {
-    background-color: #d4edda;
-    border-color: #c3e6cb;
+.card {
+    background-color: var(--surface-color);
+    padding: 2rem;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    text-align: center;
+    transition: transform 0.2s ease;
+}
+
+.card:hover {
+    transform: translateY(-4px);
+}
+
+.card h3 {
+    color: var(--primary-color);
+    margin-bottom: 1rem;
+}
+
+.page-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 2rem;
+    padding-bottom: 1rem;
+    border-bottom: 2px solid var(--border-color);
+}
+
+.flash-messages {
+    margin-bottom: 2rem;
+}
+
+.flash {
+    padding: 1rem;
+    border-radius: 6px;
+    margin-bottom: 1rem;
+    font-weight: 500;
+}
+
+.flash.success {
+    background-color: #D4EDDA;
     color: #155724;
+    border: 1px solid #C3E6CB;
 }
 
-.alert-danger {
-    background-color: #f8d7da;
-    border-color: #f5c6cb;
-    color: #721c24;
+.flash.danger {
+    background-color: #F8D7DA;
+    color: #721C24;
+    border: 1px solid #F5C6CB;
+}
+
+body.dark .flash.success {
+    background-color: #1C4A2E;
+    color: #A7D6B7;
+}
+
+body.dark .flash.danger {
+    background-color: #4A1C1C;
+    color: #D6A7A7;
 }
 
 code {
-    background-color: #f8f9fa;
-    padding: 2px 4px;
-    border-radius: 3px;
-    font-size: 0.9em;
+    background-color: var(--border-color);
+    padding: 0.2rem 0.4rem;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+}
+
+.output-container {
+    margin-top: 2rem;
+    background-color: var(--surface-color);
+    border-radius: 8px;
+    padding: 1rem;
+    border: 1px solid var(--border-color);
+}
+
+.output-container pre {
+    background-color: var(--background-color);
+    padding: 1rem;
+    border-radius: 4px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    border: 1px solid var(--border-color);
+}
+
+.badge {
+    display: inline-block;
+    padding: 0.25rem 0.5rem;
+    background-color: var(--primary-color);
+    color: white;
+    font-size: 0.75rem;
+    border-radius: 12px;
+    margin-right: 0.25rem;
+}
+
+.command-examples {
+    margin-top: 2rem;
+    background-color: var(--surface-color);
+    padding: 1.5rem;
+    border-radius: 8px;
+    border-left: 4px solid var(--primary-color);
+}
+
+.command-examples ul {
+    list-style-type: none;
+    padding-left: 0;
+}
+
+.command-examples li {
+    margin-bottom: 0.5rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.login-container {
+    max-width: 400px;
+    margin: 4rem auto;
+    padding: 2rem;
+    background-color: var(--surface-color);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+}
+
+.login-container h2 {
+    text-align: center;
+    margin-bottom: 2rem;
+    color: var(--primary-color);
+}
+
+@media (max-width: 768px) {
+    nav {
+        flex-direction: column;
+        gap: 1rem;
+    }
+    
+    nav ul {
+        flex-wrap: wrap;
+        justify-content: center;
+    }
+    
+    .page-header {
+        flex-direction: column;
+        gap: 1rem;
+    }
+    
+    .dashboard-cards {
+        grid-template-columns: 1fr;
+    }
+    
+    main {
+        padding: 0 1rem;
+    }
 }
 EOF
 
-# Criar script de inicialização do banco
-log "Criando script de inicialização..."
-cat > init_db.py << EOF
+# Criar comandos importantes
+cat << 'EOF' | sudo -u ansitrix tee $APP_DIR/init_commands.py > /dev/null
 #!/usr/bin/env python3
-import os
 import sys
-from app import app, db, User, ComandoRapido
+import os
+sys.path.append('/opt/ansitrix')
 
-def init_database():
-    with app.app_context():
-        # Criar todas as tabelas
-        db.create_all()
-        
-        # Verificar se já existe usuário admin
-        if not User.query.filter_by(username='grafeno').first():
-            # Criar usuário admin
-            admin = User(username='grafeno')
-            admin.set_password('$ADMIN_PASSWORD')
-            db.session.add(admin)
-            
-            # Adicionar comandos padrão
-            comandos_padrao = [
-                {
-                    'name': 'Reboot',
-                    'command': '/system reboot',
-                    'description': 'Reinicia o sistema Mikrotik'
-                },
-                {
-                    'name': 'Export Config',
-                    'command': '/export file=backup_config',
-                    'description': 'Exporta a configuração completa para arquivo'
-                },
-                {
-                    'name': 'Show Users',
-                    'command': '/user print',
-                    'description': 'Lista todos os usuários do sistema'
-                },
-                {
-                    'name': 'Show Version',
-                    'command': '/system resource print',
-                    'description': 'Mostra informações do sistema e recursos'
-                },
-                {
-                    'name': 'Show IP Addresses',
-                    'command': '/ip address print',
-                    'description': 'Lista todos os endereços IP configurados'
-                },
-                {
-                    'name': 'Show Interfaces',
-                    'command': '/interface print',
-                    'description': 'Lista todas as interfaces de rede'
-                },
-                {
-                    'name': 'Show Routes',
-                    'command': '/ip route print',
-                    'description': 'Lista a tabela de roteamento'
-                },
-                {
-                    'name': 'Show DHCP Leases',
-                    'command': '/ip dhcp-server lease print',
-                    'description': 'Lista os leases do servidor DHCP'
-                }
-            ]
-            
-            for cmd_data in comandos_padrao:
-                cmd = ComandoRapido(**cmd_data)
-                db.session.add(cmd)
-            
-            db.session.commit()
-            print("✅ Banco de dados inicializado com sucesso!")
-            print(f"👤 Usuário: grafeno")
-            print(f"🔑 Senha: $ADMIN_PASSWORD")
-            print(f"📝 {len(comandos_padrao)} comandos rápidos adicionados")
-        else:
-            print("ℹ️  Banco de dados já inicializado")
+from app import app, db, Command
 
-if __name__ == '__main__':
-    init_database()
+important_commands = [
+    {"name": "Reboot System", "command_text": "/system reboot"},
+    {"name": "Export Configuration", "command_text": "/export"},
+    {"name": "System Resource Info", "command_text": "/system resource print"},
+    {"name": "Interface List", "command_text": "/interface print"},
+    {"name": "IP Address List", "command_text": "/ip address print"},
+    {"name": "Firewall Rules", "command_text": "/ip firewall filter print"},
+    {"name": "User List", "command_text": "/user print"},
+    {"name": "System Identity", "command_text": "/system identity print"},
+    {"name": "System Backup", "command_text": "/system backup save name=backup"},
+    {"name": "System Update Check", "command_text": "/system package update check-for-updates"}
+]
+
+with app.app_context():
+    db.create_all()
+    for cmd_data in important_commands:
+        existing_cmd = Command.query.filter_by(name=cmd_data["name"]).first()
+        if not existing_cmd:
+            cmd = Command(name=cmd_data["name"], command_text=cmd_data["command_text"])
+            db.session.add(cmd)
+    db.session.commit()
+    print("Comandos importantes adicionados ao banco de dados.")
 EOF
 
-# Criar arquivo de configuração systemd
-log "Criando serviço systemd..."
-cat > /etc/systemd/system/grafeno-automate.service << EOF
+sudo chmod +x $APP_DIR/init_commands.py
+cd $APP_DIR && sudo -u ansitrix ./venv/bin/python init_commands.py
+
+echo "Parte 3 concluída: templates HTML, CSS e comandos criados."
+
+# ==========================================
+# PARTE 4: CONFIGURAÇÃO DO SISTEMA
+# ==========================================
+
+echo "Parte 4: Configurando sistema, nginx, firewall e segurança..."
+
+# Configuração do Nginx
+cat << 'EOF' | sudo tee /etc/nginx/sites-available/ansitrix > /dev/null
+server {
+    listen 80;
+    server_name _;
+
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer-when-downgrade" always;
+
+    limit_req_zone $binary_remote_addr zone=ansitrix:10m rate=10r/s;
+    limit_req zone=ansitrix burst=20 nodelay;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 10s;
+        proxy_read_timeout 10s;
+    }
+
+    location /static {
+        alias /opt/ansitrix/static;
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+
+sudo ln -sf /etc/nginx/sites-available/ansitrix /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl reload nginx
+
+# Gerar chaves seguras
+SECRET_KEY=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+FERNET_KEY=$(python3 -c 'import base64; import os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+
+# Service do systemd
+cat << EOF | sudo tee /etc/systemd/system/ansitrix.service > /dev/null
 [Unit]
-Description=Grafeno Automate - Sistema de Gerenciamento Mikrotik
+Description=Ansitrix - Mikrotik Management Tool
 After=network.target
 
 [Service]
-Type=exec
-User=root
-WorkingDirectory=$APP_DIR
-Environment="PATH=$APP_DIR/venv/bin"
-Environment="SECRET_KEY=$SECRET_KEY"
-ExecStart=$APP_DIR/venv/bin/gunicorn -w 4 -b 127.0.0.1:8000 app:app
-ExecReload=/bin/kill -HUP \$MAINPID
+Type=simple
+User=ansitrix
+Group=ansitrix
+WorkingDirectory=/opt/ansitrix
+Environment=ANSITRIX_SECRET_KEY=$SECRET_KEY
+Environment=ANSITRIX_FERNET_KEY=$FERNET_KEY
+ExecStart=/opt/ansitrix/venv/bin/python app.py
 Restart=always
-RestartSec=5
+RestartSec=3
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/ansitrix
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Configurar Nginx
-log "Configurando Nginx..."
-cat > /etc/nginx/sites-available/grafeno-automate << 'EOF'
-server {
-    listen 80;
-    server_name _;
+# Configurar fail2ban
+cat << 'EOF' | sudo tee /etc/fail2ban/jail.local > /dev/null
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
 
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+logpath = /var/log/nginx/error.log
 
-    location /static/ {
-        alias /opt/grafeno_automate/static/;
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # Logs
-    access_log /var/log/nginx/grafeno-automate_access.log;
-    error_log /var/log/nginx/grafeno-automate_error.log;
-}
+[nginx-limit-req]
+enabled = true
+filter = nginx-limit-req
+logpath = /var/log/nginx/error.log
+maxretry = 10
 EOF
 
-# Ativar site no Nginx
-rm -f /etc/nginx/sites-enabled/default
-ln -sf /etc/nginx/sites-available/grafeno-automate /etc/nginx/sites-enabled/
+# Script de backup
+cat << 'EOF' | sudo tee /opt/ansitrix/backup.sh > /dev/null
+#!/bin/bash
+BACKUP_DIR="/opt/ansitrix/backups"
+DATE=$(date +%Y%m%d_%H%M%S)
 
-# Testar configuração do Nginx
-nginx -t
+mkdir -p $BACKUP_DIR
 
-# Alterar permissões
-chown -R root:root $APP_DIR
-chmod +x init_db.py
+cp /opt/ansitrix/ansitrix.db $BACKUP_DIR/ansitrix_$DATE.db
+tar -czf $BACKUP_DIR/logs_$DATE.tar.gz /opt/ansitrix/logs/ 2>/dev/null || true
 
-# Inicializar banco de dados
-log "Inicializando banco de dados..."
-cd $APP_DIR
-source venv/bin/activate
-python3 init_db.py
+find $BACKUP_DIR -name "ansitrix_*.db" -mtime +7 -delete
+find $BACKUP_DIR -name "logs_*.tar.gz" -mtime +7 -delete
+
+echo "Backup realizado: $DATE"
+EOF
+
+sudo chmod +x /opt/ansitrix/backup.sh
+sudo chown ansitrix:ansitrix /opt/ansitrix/backup.sh
+
+# Cron job para backup diário
+echo "0 2 * * * /opt/ansitrix/backup.sh >> /opt/ansitrix/logs/backup.log 2>&1" | sudo -u ansitrix crontab -
+
+# Configurar firewall
+sudo ufw allow ssh
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw --force enable
+
+# Definir permissões finais
+sudo -u ansitrix mkdir -p /opt/ansitrix/logs
+sudo -u ansitrix touch /opt/ansitrix/logs/app.log
+sudo chmod 755 /opt/ansitrix
+sudo chmod 644 /opt/ansitrix/*.py
+sudo chmod 644 /opt/ansitrix/templates/*
+sudo chmod 644 /opt/ansitrix/static/css/*
+sudo chown -R ansitrix:ansitrix /opt/ansitrix
 
 # Habilitar e iniciar serviços
-log "Habilitando e iniciando serviços..."
-systemctl daemon-reload
-systemctl enable grafeno-automate
-systemctl start grafeno-automate
-systemctl restart nginx
+sudo systemctl daemon-reload
+sudo systemctl enable ansitrix
+sudo systemctl start ansitrix
+sudo systemctl enable nginx
+sudo systemctl start nginx
+sudo systemctl enable fail2ban
+sudo systemctl start fail2ban
 
-# Verificar status dos serviços
-log "Verificando status dos serviços..."
-sleep 3
+# Aguardar inicialização
+sleep 5
 
-if systemctl is-active --quiet grafeno-automate; then
-    log "✅ Serviço Grafeno Automate está rodando"
+echo "Parte 4 concluída: configuração do sistema finalizada."
+
+# ==========================================
+# FINALIZAÇÃO E INFORMAÇÕES
+# ==========================================
+
+echo "================================================================"
+echo "                    ANSITRIX INSTALADO COM SUCESSO!"
+echo "================================================================"
+echo ""
+echo "Informações de Acesso:"
+echo "----------------------"
+echo "URL de Acesso: http://$(hostname -I | awk '{print $1}')"
+echo "Usuário: admin"
+echo "Senha: ansitrix123"
+echo ""
+echo "IMPORTANTE: Altere a senha padrão após o primeiro login!"
+echo ""
+echo "Comandos úteis:"
+echo "- Status do serviço: sudo systemctl status ansitrix"
+echo "- Ver logs: sudo journalctl -u ansitrix -f"
+echo "- Reiniciar: sudo systemctl restart ansitrix"
+echo "- Backup manual: sudo /opt/ansitrix/backup.sh"
+echo ""
+echo "A ferramenta inclui comandos importantes pré-cadastrados para"
+echo "gerenciamento de Mikrotiks via Ansible."
+echo ""
+echo "================================================================"
+
+# Verificação final
+if curl -s http://localhost >/dev/null 2>&1; then
+    echo "✓ Ansitrix está funcionando corretamente!"
 else
-    error "❌ Falha ao iniciar serviço Grafeno Automate"
+    echo "⚠ Verifique os logs se houver problemas de acesso."
+    echo "Para debug: sudo journalctl -u ansitrix -f"
 fi
 
-if systemctl is-active --quiet nginx; then
-    log "✅ Nginx está rodando"
-else
-    error "❌ Falha ao iniciar Nginx"
-fi
-
-# Configurar firewall (se estiver ativo)
-if systemctl is-active --quiet ufw; then
-    log "Configurando firewall..."
-    ufw allow 80/tcp
-    ufw allow 22/tcp
-    ufw --force enable
-fi
-
-# Informações finais
-log "=========================================="
-log "    GRAFENO AUTOMATE - INSTALAÇÃO CONCLUÍDA"
-log "=========================================="
-log ""
-log "🌐 Acesse: http://$(hostname -I | awk '{print $1}')"
-log "👤 Usuário: grafeno"
-log "🔑 Senha: $ADMIN_PASSWORD"
-log ""
-log "📁 Diretório da aplicação: $APP_DIR"
-log "📊 Logs da aplicação: $APP_DIR/logs/"
-log "📊 Logs do Nginx: /var/log/nginx/"
-log ""
-log "🔧 Comandos úteis:"
-log "   Reiniciar aplicação: systemctl restart grafeno-automate"
-log "   Ver logs: journalctl -u grafeno-automate -f"
-log "   Status: systemctl status grafeno-automate"
-log ""
-log "⚠️  IMPORTANTE: Anote a senha acima, ela não será exibida novamente!"
-log ""
-
-# Salvar credenciais em arquivo
-echo "=========================================" > $APP_DIR/CREDENCIAIS.txt
-echo "GRAFENO AUTOMATE - CREDENCIAIS DE ACESSO" >> $APP_DIR/CREDENCIAIS.txt
-echo "=========================================" >> $APP_DIR/CREDENCIAIS.txt
-echo "URL: http://$(hostname -I | awk '{print $1}')" >> $APP_DIR/CREDENCIAIS.txt
-echo "Usuário: grafeno" >> $APP_DIR/CREDENCIAIS.txt
-echo "Senha: $ADMIN_PASSWORD" >> $APP_DIR/CREDENCIALS.txt
-echo "Data da instalação: $(date)" >> $APP_DIR/CREDENCIALS.txt
-echo "=========================================" >> $APP_DIR/CREDENCIALS.txt
-
-log "💾 Credenciais salvas em: $APP_DIR/CREDENCIALS.txt"
-EOF
-
----
-
-## 2. Como usar
-
-### 2.1. Baixe e execute o script:
-
-```bash
-# Baixar o script
-wget https://raw.githubusercontent.com/seuusuario/grafeno-automate/main/install_grafeno_automate.sh
-
-# Ou crie o arquivo manualmente e cole o conteúdo
-nano install_grafeno_automate.sh
-
-# Dar permissão de execução
-chmod +x install_grafeno_automate.sh
-
-# Executar como root
-sudo ./install_grafeno_automate.sh
+echo ""
+echo "Instalação finalizada em $(date)"
+echo "================================================================"
