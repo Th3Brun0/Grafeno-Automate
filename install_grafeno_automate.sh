@@ -39,7 +39,7 @@ step "1. Preparando o Sistema Operacional"
 log "Atualizando a lista de pacotes e o sistema..."
 apt-get update && apt-get upgrade -y
 
-log "Instalando dependências essenciais..."
+log "Instalando dependências essenciais (Python, Nginx, Ansible)..."
 apt-get install -y python3 python3-pip python3-venv nginx git curl openssl ansible
 
 # --- Criação de Usuário e Diretório ---
@@ -78,7 +78,6 @@ flask-login
 flask_sqlalchemy
 gunicorn
 bcrypt
-ansible-runner
 EOF
 
 log "Instalando dependências Python no ambiente virtual..."
@@ -87,7 +86,7 @@ pip install -r requirements.txt
 deactivate
 
 # --- Estrutura de Diretórios ---
-log "Criando estrutura de diretórios (templates, static, playbooks)..."
+log "Criando estrutura de diretórios (templates, static, ansible)..."
 mkdir -p templates static/css ansible/playbooks logs
 
 # --- Arquivo Principal: app.py ---
@@ -131,7 +130,7 @@ class Mikrotik(db.Model):
     name = db.Column(db.String(100), nullable=False)
     ip = db.Column(db.String(40), nullable=False, unique=True)
     username = db.Column(db.String(100), nullable=False)
-    password = db.Column(db.String(100), nullable=False) # Em um ambiente real, use criptografia!
+    password = db.Column(db.String(100), nullable=False)
     grupo_id = db.Column(db.Integer, db.ForeignKey('grupo.id'))
 
 class Grupo(db.Model):
@@ -146,8 +145,8 @@ class Comando(db.Model):
 
 class LogExecucao(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    mikrotik_id = db.Column(db.Integer, db.ForeignKey('mikrotik.id'), nullable=False)
-    comando_id = db.Column(db.Integer, db.ForeignKey('comando.id'), nullable=False)
+    mikrotik_id = db.Column(db.Integer, db.ForeignKey('mikrotik.id'))
+    comando_id = db.Column(db.Integer, db.ForeignKey('comando.id'))
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     status = db.Column(db.String(20), nullable=False) # success, failed, unreachable
     output = db.Column(db.Text)
@@ -190,7 +189,7 @@ def dashboard():
         'logs': LogExecucao.query.count()
     }
     recent_logs = LogExecucao.query.order_by(LogExecucao.executed_at.desc()).limit(5).all()
-    return render_template('dashboard.html', stats=stats, logs=recent_logs)
+    return render_template('dashboard.html', stats=stats, logs=recent_logs, all_mikrotiks=Mikrotik.query.all(), all_comandos=Comando.query.all())
 
 @app.route('/mikrotiks')
 @login_required
@@ -222,7 +221,6 @@ def ver_logs():
 @app.route('/mikrotik/add', methods=['POST'])
 @login_required
 def add_mikrotik():
-    # Lógica para adicionar Mikrotik
     grupo_id = request.form.get('grupo_id')
     new_mikrotik = Mikrotik(
         name=request.form['name'],
@@ -240,14 +238,12 @@ def add_mikrotik():
 @login_required
 def delete_mikrotik(id):
     mikrotik = Mikrotik.query.get_or_404(id)
-    # Desassociar logs antes de deletar para evitar erro de FK
     LogExecucao.query.filter_by(mikrotik_id=id).update({LogExecucao.mikrotik_id: None})
     db.session.delete(mikrotik)
     db.session.commit()
     flash(f'Mikrotik "{mikrotik.name}" removido.', 'success')
     return redirect(url_for('gerenciar_mikrotiks'))
 
-# ... (Rotas para add/delete de Comandos e Grupos de forma similar) ...
 @app.route('/comando/add', methods=['POST'])
 @login_required
 def add_comando():
@@ -280,11 +276,11 @@ def add_grupo():
 @login_required
 def delete_grupo(id):
     group = Grupo.query.get_or_404(id)
+    Mikrotik.query.filter_by(grupo_id=id).update({Mikrotik.grupo_id: None})
     db.session.delete(group)
     db.session.commit()
     flash(f'Grupo "{group.name}" removido.', 'success')
     return redirect(url_for('gerenciar_grupos'))
-
 
 # --- Rota de Execução com Ansible ---
 @app.route('/executar_ansible', methods=['POST'])
@@ -296,7 +292,6 @@ def executar_ansible():
     mikrotik = Mikrotik.query.get_or_404(mikrotik_id)
     comando = Comando.query.get_or_404(comando_id)
 
-    # Criar inventário temporário para o Ansible
     inventory_content = f"""
 [mikrotik]
 {mikrotik.ip}
@@ -306,13 +301,12 @@ ansible_user={mikrotik.username}
 ansible_password={mikrotik.password}
 ansible_network_os=routeros
 ansible_connection=network_cli
-ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
 """
-    inventory_path = os.path.join(app.config['ANSIBLE_DIR'], 'inventory.ini')
+    inventory_path = os.path.join(app.config['ANSIBLE_DIR'], f'inventory_{mikrotik.id}.ini')
     with open(inventory_path, 'w') as f:
         f.write(inventory_content)
 
-    # Comando para executar o playbook do Ansible
     playbook_path = os.path.join(app.config['ANSIBLE_DIR'], 'playbooks', 'run_command.yml')
     cmd_to_run = [
         'ansible-playbook',
@@ -320,39 +314,35 @@ ansible_ssh_common_args='-o StrictHostKeyChecking=no'
         playbook_path,
         '--extra-vars', f"target_host={mikrotik.ip} routeros_command='{comando.command}'"
     ]
+    
+    status = "failed"
+    log_output = ""
 
     try:
-        # Executar o processo e capturar a saída
-        result = subprocess.run(cmd_to_run, capture_output=True, text=True, check=True, timeout=60)
+        result = subprocess.run(cmd_to_run, capture_output=True, text=True, timeout=60)
         
-        # Analisar a saída para determinar o status
-        output_lines = result.stdout.splitlines()
-        task_result = ""
-        status = "failed" # Padrão é falha
+        recap_line = [line for line in result.stdout.splitlines() if "PLAY RECAP" in line]
+        if recap_line:
+            if f"unreachable=1" in recap_line[0]: status = "unreachable"
+            elif f"failed=1" in recap_line[0]: status = "failed"
+            else: status = "success"
         
-        for line in output_lines:
-            if f"ok: [{mikrotik.ip}]" in line:
-                status = "success"
-            if "PLAY RECAP" in line:
-                if f"unreachable=1" in line: status = "unreachable"
-                elif f"failed=1" in line: status = "failed"
-            if "STDOUT" in line: # Captura o início do output do comando
-                task_result = "\n".join(output_lines[output_lines.index(line) + 2:-2])
-                break
-        
-        log_output = task_result if status == 'success' else result.stdout + "\n" + result.stderr
-        flash(f'Comando "{comando.name}" executado em "{mikrotik.name}". Status: {status.upper()}', 'info' if status == 'success' else 'danger')
+        log_output = result.stdout + "\n" + result.stderr
+        flash(f'Comando "{comando.name}" em "{mikrotik.name}". Status: {status.upper()}', 'success' if status == 'success' else 'danger')
 
-    except subprocess.CalledProcessError as e:
-        status = "failed"
-        log_output = e.stdout + "\n" + e.stderr
-        flash(f'Erro ao executar playbook para "{mikrotik.name}".', 'danger')
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         status = "failed"
         log_output = "Timeout: A execução demorou mais de 60 segundos."
         flash(f'Timeout ao executar comando em "{mikrotik.name}".', 'danger')
+    except Exception as e:
+        status = "failed"
+        log_output = str(e)
+        flash(f'Erro inesperado ao executar playbook para "{mikrotik.name}".', 'danger')
 
-    # Salvar log no banco
+    finally:
+        if os.path.exists(inventory_path):
+            os.remove(inventory_path)
+
     new_log = LogExecucao(
         mikrotik_id=mikrotik.id,
         comando_id=comando.id,
@@ -435,6 +425,13 @@ cat > templates/login.html << 'EOF'
             <div class="card shadow-lg">
                 <div class="card-body p-5">
                     <h2 class="text-center fw-bold mb-4">GRAFENO AUTOMATE</h2>
+                    {% with messages = get_flashed_messages(with_categories=true ) %}
+                        {% if messages %}
+                            {% for category, message in messages %}
+                                <div class="alert alert-{{ category }}">{{ message }}</div>
+                            {% endfor %}
+                        {% endif %}
+                    {% endwith %}
                     <form method="POST">
                         <div class="mb-3">
                             <label for="username" class="form-label">Usuário</label>
@@ -461,27 +458,24 @@ cat > templates/dashboard.html << 'EOF'
 {% block content %}
 <div class="container-fluid">
     <h3 class="mb-4">Dashboard</h3>
-    <!-- Cards de Estatísticas -->
     <div class="row">
         <div class="col-xl-3 col-md-6 mb-4"><div class="card border-left-primary shadow h-100 py-2"><div class="card-body"><div class="row no-gutters align-items-center"><div class="col mr-2"><div class="text-xs fw-bold text-primary text-uppercase mb-1">Mikrotiks</div><div class="h5 mb-0 fw-bold text-gray-800">{{ stats.mikrotiks }}</div></div><div class="col-auto"><i class="bi bi-router-fill fs-2 text-gray-300"></i></div></div></div></div></div>
         <div class="col-xl-3 col-md-6 mb-4"><div class="card border-left-success shadow h-100 py-2"><div class="card-body"><div class="row no-gutters align-items-center"><div class="col mr-2"><div class="text-xs fw-bold text-success text-uppercase mb-1">Grupos</div><div class="h5 mb-0 fw-bold text-gray-800">{{ stats.grupos }}</div></div><div class="col-auto"><i class="bi bi-collection-fill fs-2 text-gray-300"></i></div></div></div></div></div>
         <div class="col-xl-3 col-md-6 mb-4"><div class="card border-left-info shadow h-100 py-2"><div class="card-body"><div class="row no-gutters align-items-center"><div class="col mr-2"><div class="text-xs fw-bold text-info text-uppercase mb-1">Comandos</div><div class="h5 mb-0 fw-bold text-gray-800">{{ stats.comandos }}</div></div><div class="col-auto"><i class="bi bi-terminal-fill fs-2 text-gray-300"></i></div></div></div></div></div>
         <div class="col-xl-3 col-md-6 mb-4"><div class="card border-left-warning shadow h-100 py-2"><div class="card-body"><div class="row no-gutters align-items-center"><div class="col mr-2"><div class="text-xs fw-bold text-warning text-uppercase mb-1">Execuções</div><div class="h5 mb-0 fw-bold text-gray-800">{{ stats.logs }}</div></div><div class="col-auto"><i class="bi bi-file-earmark-text-fill fs-2 text-gray-300"></i></div></div></div></div></div>
     </div>
-    <!-- Formulário de Execução Rápida -->
     <div class="card shadow mb-4">
         <div class="card-header py-3"><h6 class="m-0 fw-bold text-primary">Execução Rápida de Comando</h6></div>
         <div class="card-body">
-            <form action="{{ url_for('executar_ansible' ) }}" method="POST">
+            <form action="{{ url_for('executar_ansible') }}" method="POST">
                 <div class="row align-items-end">
-                    <div class="col-md-5 mb-3"><label for="mikrotik_id" class="form-label">Selecione o Mikrotik</label><select name="mikrotik_id" class="form-select" required>{% for m in Mikrotik.query.all() %}<option value="{{ m.id }}">{{ m.name }} ({{ m.ip }})</option>{% endfor %}</select></div>
-                    <div class="col-md-5 mb-3"><label for="comando_id" class="form-label">Selecione o Comando</label><select name="comando_id" class="form-select" required>{% for c in Comando.query.all() %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
+                    <div class="col-md-5 mb-3"><label for="mikrotik_id" class="form-label">Selecione o Mikrotik</label><select name="mikrotik_id" class="form-select" required><option value="" disabled selected>Escolha um Mikrotik...</option>{% for m in all_mikrotiks %}<option value="{{ m.id }}">{{ m.name }} ({{ m.ip }})</option>{% endfor %}</select></div>
+                    <div class="col-md-5 mb-3"><label for="comando_id" class="form-label">Selecione o Comando</label><select name="comando_id" class="form-select" required><option value="" disabled selected>Escolha um Comando...</option>{% for c in all_comandos %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}</select></div>
                     <div class="col-md-2 mb-3"><button type="submit" class="btn btn-primary w-100">Executar</button></div>
                 </div>
             </form>
         </div>
     </div>
-    <!-- Logs Recentes -->
     <div class="card shadow mb-4">
         <div class="card-header py-3"><h6 class="m-0 fw-bold text-primary">Logs de Execução Recentes</h6></div>
         <div class="card-body">
@@ -494,7 +488,7 @@ cat > templates/dashboard.html << 'EOF'
                             <td>{{ log.executed_at.strftime('%d/%m/%Y %H:%M') }}</td>
                             <td>{{ log.mikrotik.name if log.mikrotik else 'N/A' }}</td>
                             <td>{{ log.comando.name if log.comando else 'N/A' }}</td>
-                            <td><span class="badge bg-{% if log.status == 'success' %}success{% elif log.status == 'unreachable' %}warning{% else %}danger{% endif %}">{{ log.status }}</span></td>
+                            <td><span class="badge bg-{% if log.status == 'success' %}success{% elif log.status == 'unreachable' %}warning text-dark{% else %}danger{% endif %}">{{ log.status }}</span></td>
                             <td>{{ log.user.username if log.user else 'N/A' }}</td>
                         </tr>
                         {% else %}
@@ -521,26 +515,28 @@ cat > templates/gerenciar_mikrotiks.html << 'EOF'
     </div>
     <div class="card shadow">
         <div class="card-body">
-            <table class="table table-hover">
-                <thead><tr><th>Nome</th><th>IP</th><th>Usuário</th><th>Grupo</th><th>Ações</th></tr></thead>
-                <tbody>
-                    {% for m in mikrotiks %}
-                    <tr>
-                        <td>{{ m.name }}</td>
-                        <td>{{ m.ip }}</td>
-                        <td>{{ m.username }}</td>
-                        <td>{{ m.grupo.name if m.grupo else 'Nenhum' }}</td>
-                        <td>
-                            <form action="{{ url_for('delete_mikrotik', id=m.id) }}" method="POST" onsubmit="return confirm('Tem certeza que deseja remover este Mikrotik?');">
-                                <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
-                            </form>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr><td colspan="5" class="text-center">Nenhum Mikrotik cadastrado.</td></tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            <div class="table-responsive">
+                <table class="table table-hover">
+                    <thead><tr><th>Nome</th><th>IP</th><th>Usuário</th><th>Grupo</th><th>Ações</th></tr></thead>
+                    <tbody>
+                        {% for m in mikrotiks %}
+                        <tr>
+                            <td>{{ m.name }}</td>
+                            <td>{{ m.ip }}</td>
+                            <td>{{ m.username }}</td>
+                            <td>{{ m.grupo.name if m.grupo else 'Nenhum' }}</td>
+                            <td>
+                                <form action="{{ url_for('delete_mikrotik', id=m.id) }}" method="POST" onsubmit="return confirm('Tem certeza que deseja remover este Mikrotik?');" class="d-inline">
+                                    <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="5" class="text-center">Nenhum Mikrotik cadastrado.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
         </div>
     </div>
 </div>
@@ -573,3 +569,25 @@ cat > templates/gerenciar_comandos.html << 'EOF'
 <div class="container-fluid">
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h3>Gerenciar Comandos</h3>
+        <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addComandoModal"><i class="bi bi-plus-circle me-2"></i>Adicionar Comando</button>
+    </div>
+    <div class="card shadow">
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-hover">
+                    <thead><tr><th>Nome</th><th>Comando RouterOS</th><th>Ações</th></tr></thead>
+                    <tbody>
+                        {% for c in comandos %}
+                        <tr>
+                            <td>{{ c.name }}</td>
+                            <td><code>{{ c.command }}</code></td>
+                            <td>
+                                <form action="{{ url_for('delete_comando', id=c.id) }}" method="POST" onsubmit="return confirm('Tem certeza?');" class="d-inline">
+                                    <button type="submit" class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                                </form>
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="3" class="text-center">Nenhum comando cadastrado.</td></tr>
+                        {% endfor %}
+                    </tbody>
