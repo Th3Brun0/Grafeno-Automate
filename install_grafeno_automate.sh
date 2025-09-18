@@ -1,41 +1,78 @@
 #!/bin/bash
-set -euo pipefail
 
-APP_DIR="/opt/grafeno_automate"
-APP_USER="grafeno"
-GUNICORN_BIND="127.0.0.1:8000"
-SECRET_KEY="$(openssl rand -hex 32)"
-ADMIN_PASS="$(openssl rand -base64 16 | tr -dc 'A-Za-z0-9@#%+=_' | head -c 16)"
-LOG_FILE="$APP_DIR/install.log"
+set -e
 
-echo "Iniciando instalação do Grafeno Automate..."
-mkdir -p "$(dirname "$LOG_FILE")"
-exec > >(tee -a "$LOG_FILE") 2>&1
+echo "=========================================="
+echo "    GRAFENO AUTOMATE - INSTALAÇÃO"
+echo "=========================================="
 
-echo "[1/10] Atualizando sistema..."
-export DEBIAN_FRONTEND=noninteractive
-apt update -y
-apt upgrade -y
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-echo "[2/10] Instalando dependências..."
-apt install -y python3 python3-venv python3-pip python3-dev build-essential libffi-dev libssl-dev nginx git curl openssl
+log() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
 
-echo "[3/10] Criando usuário $APP_USER..."
-if ! id "$APP_USER" &>/dev/null; then
-  useradd -m -s /bin/bash "$APP_USER"
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+    exit 1
+}
+
+if [ "$EUID" -ne 0 ]; then
+    error "Execute este script como root (sudo ./install_grafeno_automate.sh)"
 fi
 
-echo "[4/10] Preparando diretórios..."
-mkdir -p "$APP_DIR"/{templates,static/css,logs}
-chown -R "$APP_USER:$APP_USER" "$APP_DIR"
+log "Atualizando sistema..."
+apt update && apt upgrade -y
 
-echo "[5/10] Criando ambiente virtual e instalando libs..."
-sudo -u "$APP_USER" python3 -m venv "$APP_DIR/venv"
-sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install --upgrade pip
-sudo -u "$APP_USER" "$APP_DIR/venv/bin/pip" install flask flask-login flask_sqlalchemy netmiko gunicorn bcrypt
+log "Instalando dependências básicas..."
+apt install python3 python3-pip python3-venv nginx git curl openssl -y
 
-echo "[6/10] Criando app.py..."
-cat > "$APP_DIR/app.py" << EOF
+if ! id "grafeno" &>/dev/null; then
+    log "Criando usuário grafeno..."
+    useradd -m -s /bin/bash grafeno
+fi
+
+APP_DIR="/opt/grafeno_automate"
+log "Criando diretório da aplicação em $APP_DIR..."
+mkdir -p $APP_DIR
+cd $APP_DIR
+
+SECRET_KEY=$(openssl rand -hex 32)
+log "Chave secreta gerada"
+
+ADMIN_PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-12)
+log "Senha do admin gerada: $ADMIN_PASSWORD"
+
+log "Criando ambiente virtual Python..."
+python3 -m venv venv
+source venv/bin/activate
+
+log "Criando requirements.txt..."
+cat > requirements.txt << EOF
+flask==2.3.3
+flask-login==0.6.3
+flask_sqlalchemy==3.0.5
+netmiko==4.2.0
+gunicorn==21.2.0
+bcrypt==4.0.1
+EOF
+
+log "Instalando dependências Python..."
+pip install --upgrade pip
+pip install -r requirements.txt
+
+log "Criando estrutura de diretórios..."
+mkdir -p templates static/css logs
+
+log "Criando aplicação principal..."
+cat > app.py << EOF
 from flask import Flask, render_template, redirect, url_for, request, flash
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, login_user, login_required, logout_user, UserMixin, current_user
@@ -43,11 +80,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from netmiko import ConnectHandler
 from datetime import datetime
 import os
+import logging
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', '$SECRET_KEY')
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///grafeno_automate.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+logging.basicConfig(filename='logs/grafeno_automate.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
 
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
@@ -96,7 +137,7 @@ class LogExecucao(db.Model):
 
     mikrotik = db.relationship('Mikrotik')
     comando = db.relationship('ComandoRapido')
-    user = db.relationship('User  ')
+    user = db.relationship('User ')
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -223,61 +264,17 @@ if __name__ == '__main__':
         with app.app_context():
             db.create_all()
             admin = User(username='grafeno')
-            admin.set_password('$ADMIN_PASS')
+            admin.set_password('$ADMIN_PASSWORD')
             db.session.add(admin)
             db.session.commit()
     app.run(host='0.0.0.0', port=5000)
 EOF
-echo "[7/10] Criando templates e CSS..."
 
-mkdir -p "$APP_DIR/templates" "$APP_DIR/static/css"
+log "Criando templates e CSS..."
 
-# base.html
-cat > "$APP_DIR/templates/base.html" << 'EOF'
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{% block title %}Grafeno Automate{% endblock %}</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet" />
-<link rel="stylesheet" href="{{ url_for('static', filename='css/grafeno.css') }}" />
-</head>
-<body class="bg-dark text-light">
-<nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
-  <div class="container-fluid">
-    <a class="navbar-brand" href="{{ url_for('dashboard') }}">Grafeno Automate</a>
-    {% if current_user.is_authenticated %}
-    <div class="d-flex">
-      <span class="navbar-text me-3">Olá, {{ current_user.username }}</span>
-      <a href="{{ url_for('logout') }}" class="btn btn-outline-light btn-sm">Sair</a>
-    </div>
-    {% endif %}
-  </div>
-</nav>
-<div class="container">
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% if messages %}
-      {% for category, message in messages %}
-        <div class="alert alert-{{ 'danger' if category == 'danger' or category == 'error' else 'success' }} alert-dismissible fade show" role="alert">
-          {{ message }}
-          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-        </div>
-      {% endfor %}
-    {% endif %}
-  {% endwith %}
-  {% block content %}{% endblock %}
-</div>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
-EOF
-echo "[7/10] Criando templates e CSS..."
+mkdir -p templates static/css
 
-mkdir -p "$APP_DIR/templates" "$APP_DIR/static/css"
-
-# base.html
-cat > "$APP_DIR/templates/base.html" << 'EOF'
+cat > templates/base.html << 'EOF'
 <!DOCTYPE html>
 <html lang="pt-br">
 <head>
@@ -317,8 +314,7 @@ cat > "$APP_DIR/templates/base.html" << 'EOF'
 </html>
 EOF
 
-# login.html
-cat > "$APP_DIR/templates/login.html" << 'EOF'
+cat > templates/login.html << 'EOF'
 {% extends "base.html" %}
 {% block title %}Login{% endblock %}
 {% block content %}
@@ -341,8 +337,7 @@ cat > "$APP_DIR/templates/login.html" << 'EOF'
 {% endblock %}
 EOF
 
-# dashboard.html (abas separadas)
-cat > "$APP_DIR/templates/dashboard.html" << 'EOF'
+cat > templates/dashboard.html << 'EOF'
 {% extends "base.html" %}
 {% block title %}Dashboard{% endblock %}
 {% block content %}
@@ -431,200 +426,142 @@ cat > "$APP_DIR/templates/dashboard.html" << 'EOF'
                 <span class="badge bg-danger">Erro</span>
               {% endif %}
             </td>
-            <td><pre style="max-height:100px;overflow:auto;">{{ log.output }}</pre>
-{% endblock %}
-EOF
-
-# add_mikrotik.html
-cat > "$APP_DIR/templates/add_mikrotik.html" << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Mikrotik - Grafeno Automate{% endblock %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-md-6">
-    <div class="card">
-      <div class="card-header">
-        <h5>Adicionar Mikrotik</h5>
-      </div>
-      <div class="card-body">
-        <form method="POST">
-          <div class="mb-3">
-            <label for="name" class="form-label">Nome</label>
-            <input type="text" class="form-control" id="name" name="name" required>
-          </div>
-          <div class="mb-3">
-            <label for="ip" class="form-label">IP</label>
-            <input type="text" class="form-control" id="ip" name="ip" required>
-          </div>
-          <div class="mb-3">
-            <label for="username" class="form-label">Usuário</label>
-            <input type="text" class="form-control" id="username" name="username" required>
-          </div>
-          <div class="mb-3">
-            <label for="password" class="form-label">Senha</label>
-            <input type="password" class="form-control" id="password" name="password" required>
-          </div>
-          <div class="mb-3">
-            <label for="grupo_id" class="form-label">Grupo (opcional)</label>
-            <select class="form-control" id="grupo_id" name="grupo_id">
-              <option value="">Selecione um grupo</option>
-              {% for grupo in grupos %}
-                <option value="{{ grupo.id }}">{{ grupo.name }}</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div class="d-flex gap-2">
-            <button type="submit" class="btn btn-primary">Salvar</button>
-            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-          </div>
-        </form>
-      </div>
-    </div>
+            <td><pre style="max-height:100px;overflow:auto;">{{ log.output }}</pre></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="text-muted">Nenhum log disponível.</p>
+    {% endif %}
   </div>
 </div>
 {% endblock %}
 EOF
 
-# add_grupo.html
-cat > "$APP_DIR/templates/add_grupo.html" << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Grupo - Grafeno Automate{% endblock %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-md-6">
-    <div class="card">
-      <div class="card-header">
-        <h5>Adicionar Grupo</h5>
-      </div>
-      <div class="card-body">
-        <form method="POST">
-          <div class="mb-3">
-            <label for="name" class="form-label">Nome</label>
-            <input type="text" class="form-control" id="name" name="name" required>
-          </div>
-          <div class="mb-3">
-            <label for="description" class="form-label">Descrição</label>
-            <textarea class="form-control" id="description" name="description" rows="3"></textarea>
-          </div>
-          <div class="d-flex gap-2">
-            <button type="submit" class="btn btn-primary">Salvar</button>
-            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-EOF
-
-# add_comando.html
-cat > "$APP_DIR/templates/add_comando.html" << 'EOF'
-{% extends "base.html" %}
-{% block title %}Adicionar Comando - Grafeno Automate{% endblock %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-md-8">
-    <div class="card">
-      <div class="card-header">
-        <h5>Adicionar Comando Rápido</h5>
-      </div>
-      <div class="card-body">
-        <form method="POST">
-          <div class="mb-3">
-            <label for="name" class="form-label">Nome</label>
-            <input type="text" class="form-control" id="name" name="name" required>
-          </div>
-          <div class="mb-3">
-            <label for="command" class="form-label">Comando RouterOS</label>
-            <textarea class="form-control" id="command" name="command" rows="4" required></textarea>
-            <small class="form-text text-muted">Exemplo: /system reboot</small>
-          </div>
-          <div class="mb-3">
-            <label for="description" class="form-label">Descrição</label>
-            <textarea class="form-control" id="description" name="description" rows="2"></textarea>
-          </div>
-          <div class="d-flex gap-2">
-            <button type="submit" class="btn btn-primary">Salvar</button>
-            <a href="{{ url_for('dashboard') }}" class="btn btn-secondary">Cancelar</a>
-          </div>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-EOF
-echo "[8/10] Criando CSS..."
-cat > "$APP_DIR/static/css/grafeno.css" << 'EOF'
-body {
-  background-color: #121212;
-  color: #e0e0e0;
-  font-family: "Fira Code", monospace, monospace;
+log "Criando CSS..."
+cat > static/css/grafeno.css << 'EOF'
+:root {
+    --grafeno-primary: #2c3e50;
+    --grafeno-secondary: #34495e;
+    --grafeno-accent: #3498db;
+    --grafeno-success: #27ae60;
+    --grafeno-warning: #f39c12;
+    --grafeno-danger: #e74c3c;
+    --grafeno-light: #ecf0f1;
+    --grafeno-dark: #2c3e50;
 }
+
+body {
+    background-color: #121212;
+    color: #e0e0e0;
+    font-family: "Fira Code", monospace, monospace;
+}
+
 a {
-  color: #82aaff;
+    color: var(--grafeno-accent);
 }
 a:hover {
-  color: #c792ea;
+    color: #c792ea;
 }
+
 .navbar {
-  background-color: #292d3e !important;
+    background-color: var(--grafeno-secondary) !important;
 }
+
 .table-dark {
-  background-color: #1e1e2f;
+    background-color: #1e1e2f;
 }
 .table-dark th, .table-dark td {
-  border-color: #44475a;
+    border-color: #44475a;
 }
+
 .btn-primary {
-  background-color: #6272a4;
-  border-color: #6272a4;
+    background-color: var(--grafeno-primary);
+    border-color: var(--grafeno-primary);
 }
 .btn-primary:hover {
-  background-color: #7083c6;
-  border-color: #7083c6;
+    background-color: var(--grafeno-secondary);
+    border-color: var(--grafeno-secondary);
 }
+
 .btn-success {
-  background-color: #50fa7b;
-  border-color: #50fa7b;
-  color: #000;
+    background-color: var(--grafeno-success);
+    border-color: var(--grafeno-success);
+    color: #000;
 }
 .btn-success:hover {
-  background-color: #3adb5a;
-  border-color: #3adb5a;
-  color: #000;
+    background-color: #3adb5a;
+    border-color: #3adb5a;
+    color: #000;
 }
+
 .badge.bg-success {
-  background-color: #50fa7b;
-  color: #000;
+    background-color: var(--grafeno-success);
+    color: #000;
 }
 .badge.bg-danger {
-  background-color: #ff5555;
+    background-color: var(--grafeno-danger);
 }
+
 pre {
-  background-color: #282a36;
-  color: #f8f8f2;
-  padding: 10px;
-  border-radius: 5px;
-  font-size: 0.85rem;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+    background-color: #282a36;
+    color: #f8f8f2;
+    padding: 10px;
+    border-radius: 5px;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-wrap: break-word;
 }
 EOF
 
-echo "[9/10] Criando serviço systemd..."
+log "Criando script de inicialização do banco..."
+cat > init_db.py << EOF
+#!/usr/bin/env python3
+from app import app, db, User, ComandoRapido
+
+def init_database():
+    with app.app_context():
+        db.create_all()
+        if not User.query.filter_by(username='grafeno').first():
+            admin = User(username='grafeno')
+            admin.set_password('$ADMIN_PASSWORD')
+            db.session.add(admin)
+            comandos_padrao = [
+                {'name': 'Reboot', 'command': '/system reboot', 'description': 'Reinicia o sistema Mikrotik'},
+                {'name': 'Export Config', 'command': '/export file=backup_config', 'description': 'Exporta configuração'},
+                {'name': 'Show Users', 'command': '/user print', 'description': 'Lista usuários'},
+                {'name': 'Show Version', 'command': '/system resource print', 'description': 'Info do sistema'},
+                {'name': 'Show IP Addresses', 'command': '/ip address print', 'description': 'Lista IPs'},
+                {'name': 'Show Interfaces', 'command': '/interface print', 'description': 'Lista interfaces'},
+                {'name': 'Show Routes', 'command': '/ip route print', 'description': 'Tabela de rotas'},
+                {'name': 'Show DHCP Leases', 'command': '/ip dhcp-server lease print', 'description': 'Leases DHCP'}
+            ]
+            for cmd in comandos_padrao:
+                db.session.add(ComandoRapido(**cmd))
+            db.session.commit()
+            print("✅ Banco de dados inicializado com sucesso!")
+            print(f"👤 Usuário: grafeno")
+            print(f"🔑 Senha: $ADMIN_PASSWORD")
+        else:
+            print("ℹ️ Banco de dados já inicializado")
+
+if __name__ == '__main__':
+    init_database()
+EOF
+
+log "Criando serviço systemd..."
 cat > /etc/systemd/system/grafeno-automate.service << EOF
 [Unit]
 Description=Grafeno Automate - Sistema de Gerenciamento Mikrotik
 After=network.target
 
 [Service]
-User =root
+User=root
 WorkingDirectory=$APP_DIR
 Environment="PATH=$APP_DIR/venv/bin"
 Environment="SECRET_KEY=$SECRET_KEY"
-ExecStart=$APP_DIR/venv/bin/gunicorn -w 4 -b $GUNICORN_BIND app:app
+ExecStart=$APP_DIR/venv/bin/gunicorn -w 4 -b 127.0.0.1:8000 app:app
 Restart=always
 RestartSec=5
 
@@ -632,14 +569,14 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-echo "[10/10] Configurando Nginx..."
+log "Configurando Nginx..."
 cat > /etc/nginx/sites-available/grafeno-automate << EOF
 server {
     listen 80;
     server_name _;
 
     location / {
-        proxy_pass http://$GUNICORN_BIND;
+        proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -662,34 +599,70 @@ ln -sf /etc/nginx/sites-available/grafeno-automate /etc/nginx/sites-enabled/
 
 nginx -t
 
-echo "Inicializando banco de dados e criando usuário admin..."
-cd "$APP_DIR"
-sudo -u "$APP_USER" bash -c "
-source venv/bin/activate
-python3 -c '
-from app import app, db, User
-with app.app_context():
-    db.create_all()
-    if not User.query.filter_by(username=\"grafeno\").first():
-        admin = User(username=\"grafeno\")
-        admin.set_password(\"$ADMIN_PASS\")
-        db.session.add(admin)
-        db.session.commit()
-        print(\"Usuário admin criado com senha: $ADMIN_PASS\")
-    else:
-        print(\"Usuário admin já existe.\")
-'
-"
+chown -R root:root $APP_DIR
+chmod +x init_db.py
 
-echo "Habilitando e iniciando serviços..."
+log "Inicializando banco de dados..."
+cd $APP_DIR
+source venv/bin/activate
+python3 init_db.py
+
+log "Habilitando e iniciando serviços..."
 systemctl daemon-reload
 systemctl enable grafeno-automate
 systemctl restart grafeno-automate
 systemctl restart nginx
 
-echo "Instalação concluída!"
-echo "Acesse: http://$(hostname -I | awk '{print $1}')"
-echo "Usuário: grafeno"
-echo "Senha: $ADMIN_PASS"
-echo "Salve essa senha, ela não será exibida novamente."
+log "Verificando status dos serviços..."
+sleep 3
 
+if systemctl is-active --quiet grafeno-automate; then
+    log "✅ Serviço Grafeno Automate está rodando"
+else
+    error "❌ Falha ao iniciar serviço Grafeno Automate"
+fi
+
+if systemctl is-active --quiet nginx; then
+    log "✅ Nginx está rodando"
+else
+    error "❌ Falha ao iniciar Nginx"
+fi
+
+if systemctl is-active --quiet ufw; then
+    log "Configurando firewall..."
+    ufw allow 80/tcp
+    ufw allow 22/tcp
+    ufw --force enable
+fi
+
+log "=========================================="
+log "    GRAFENO AUTOMATE - INSTALAÇÃO CONCLUÍDA"
+log "=========================================="
+log ""
+log "🌐 Acesse: http://$(hostname -I | awk '{print $1}')"
+log "👤 Usuário: grafeno"
+log "🔑 Senha: $ADMIN_PASSWORD"
+log ""
+log "📁 Diretório da aplicação: $APP_DIR"
+log "📊 Logs da aplicação: $APP_DIR/logs/"
+log "📊 Logs do Nginx: /var/log/nginx/"
+log ""
+log "🔧 Comandos úteis:"
+log "   systemctl restart grafeno-automate"
+log "   journalctl -u grafeno-automate -f"
+log "   systemctl status grafeno-automate"
+log ""
+log "⚠️  IMPORTANTE: Anote a senha acima, ela não será exibida novamente!"
+log ""
+
+echo "=========================================" > $APP_DIR/CREDENCIAIS.txt
+echo "GRAFENO AUTOMATE - CREDENCIAIS DE ACESSO" >> $APP_DIR/CREDENCIAIS.txt
+echo "=========================================" >> $APP_DIR/CREDENCIAIS.txt
+echo "URL: http://$(hostname -I | awk '{print $1}')" >> $APP_DIR/CREDENCIAIS.txt
+echo "Usuário: grafeno" >> $APP_DIR/CREDENCIAIS.txt
+echo "Senha: $ADMIN_PASSWORD" >> $APP_DIR/CREDENCIAIS.txt
+echo "Data da instalação: $(date)" >> $APP_DIR/CREDENCIAIS.txt
+echo "=========================================" >> $APP_DIR/CREDENCIAIS.txt
+
+log "💾 Credenciais salvas em: $APP_DIR/CREDENCIAIS.txt"
+                
